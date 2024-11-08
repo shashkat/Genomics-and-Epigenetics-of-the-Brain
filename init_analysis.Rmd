@@ -1,0 +1,204 @@
+---
+title: "GEB Initial Analysis"
+author: "Jonathan Zhu"
+date: "2024-11-07"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(gplots)
+library(ggplot2)
+library(phylolm)
+library(dplyr)
+library(janitor)
+```
+
+## Load and Clean Data
+
+```{r}
+#load random sample back in for future runs
+opc_peaks_randsamp <- as.matrix(read.csv("opc_randsamp.csv"))
+
+#split by species of interest: hypselodonts vs non-hypselodonts
+#first rename the columns to the species given in the text file
+names <- readLines(con = "240_predictions_NamesList.txt")
+names <- c("", "Region", names)
+
+colnames(opc_peaks_randsamp) <- names
+
+#first get list of hypselodonts
+#this dataframe was made using the phenotype information data
+hyps_data <- read.csv("hypselodonts_known.csv")
+
+hyps <- hyps_data %>% filter(Hypselodonty == 1)
+nonhyps <- hyps_data %>% filter(Hypselodonty == 0)
+
+hyps_names <- hyps$Name
+nonhyps_names <- nonhyps$Name
+
+#now we can select hypselodonts
+hyps_opc_peaks <- as.data.frame(opc_peaks_randsamp) %>% select(any_of(hyps_names))
+
+rownames(hyps_opc_peaks) <- opc_peaks_randsamp[,"Region"]
+#hyps_opc_peaks[1:5, 1:5]
+dim(hyps_opc_peaks)
+
+nonhyps_opc_peaks <- as.data.frame(opc_peaks_randsamp) %>% select(any_of(nonhyps_names))
+rownames(nonhyps_opc_peaks) <- opc_peaks_randsamp[,"Region"]
+#nonhyps_opc_peaks[1:5, 1:5]
+dim(nonhyps_opc_peaks)
+```
+
+## T-Tests
+
+```{r}
+#code to do this part borrowed from HW2
+diffPvaluesV <- rep(NA,nrow(hyps_opc_peaks)); #Create an empty vector to store the p-values per open chromatin region in
+names(diffPvaluesV) <- rownames(hyps_opc_peaks); #Name that vector with the peak names
+diffMeansV <- diffPvaluesV #Create a new vector, also empty, to store the differences across species
+
+#modified to do hypselodonts
+peak_ids <- rownames(hyps_opc_peaks)
+for(curPeak in peak_ids) { #Loop through each of the peaks
+  hypVals <- as.numeric(hyps_opc_peaks[curPeak,]); #For that peak get the HYPSELODONT predicitons
+  nonHypVals <- as.numeric(nonhyps_opc_peaks[curPeak,]); #For that peak get the NON-HYPSELODONT predicitons
+    if(sd(hypVals,na.rm=T) > 0 && sd(nonHypVals,na.rm=T) > 0) { #Ensure that standard deviation greater than 0
+      curTtest <- t.test(x=hypVals,y=nonHypVals);
+      diffPvaluesV[curPeak] <- curTtest$p.value
+      diffMeansV[curPeak] <- mean(hypVals,na.rm=T) - mean(nonHypVals,na.rm=T);
+    }
+}
+
+diffResultsF <- data.frame(id=peak_ids, meanDiff=diffMeansV, pvalue=diffPvaluesV, padj = p.adjust(diffPvaluesV))
+diffResultsSortF <- diffResultsF[order(diffResultsF$padj),]
+diffResultsSortF[1:10,]
+```
+
+## PhyloLM
+
+```{r}
+hypsTemp <- t(hyps_opc_peaks)
+hypsTemp <- as.data.frame(hypsTemp)
+hypsTemp <- hypsTemp %>% mutate(Hypselodont = 1)
+
+nonhypsTemp <- t(nonhyps_opc_peaks)
+nonhypsTemp <- as.data.frame(nonhypsTemp)
+nonhypsTemp <- nonhypsTemp %>% mutate(Hypselodont = 0)
+
+combined_hyp_peaks <- bind_rows(hypsTemp, nonhypsTemp)
+combined_hyp_peaks[1:5, 1:5]
+dim(combined_hyp_peaks)
+
+#write this as csv so that we can read it in to do phylolm
+write.csv(combined_hyp_peaks, file="hyps_opc_peaks.csv")
+```
+
+```{r}
+library(phylolm)
+zoonomiaTree <- read.tree(file = "Zoonomia_ChrX_lessGC40_241species_30Consensus.tree")
+
+#load in data from earlier:
+#opc_peaks_randsamp <- as.matrix(read.csv("~/geb/data/opc_randsamp.csv"))
+#combined_hyp_peaks <- read.csv("~/geb/data/hyps_opc_peaks.csv")
+#combined_hyp_peaks[1:5,1:5]
+
+combined_hyp_peaks <- clean_names(combined_hyp_peaks)
+peakNames <- colnames(combined_hyp_peaks)
+peakNames <- peakNames[! peakNames %in% c('hypselodont')]
+peakNames[1:5]
+```
+
+```{r}
+PvaluesPHY <- rep(NA,nrow(hyps_opc_peaks))
+names(PvaluesPHY) <- rownames(hyps_opc_peaks)
+corrsPHY <- PvaluesPHY
+slopesPHY <- PvaluesPHY
+
+curIndex = 1
+
+for(curPeak in peakNames) {
+    peakLmFit <- phylolm(as.numeric(combined_hyp_peaks[,curIndex]) ~ hypselodont, 
+                         data=combined_hyp_peaks, 
+                         phy=zoonomiaTree, model="BM")
+    peakLmFitSum <- summary(peakLmFit)
+    
+    PvaluesPHY[curPeak] <- peakLmFitSum$coefficients[8]
+    slopesPHY[curPeak] <- peakLmFitSum$coefficients[2]
+    #print(peakLmFitSum$coefficients[8])
+    corrsPHY[curPeak] <- peakLmFitSum$adj.r.squared
+    curIndex <- curIndex + 1
+}
+
+phyloRes <- data.frame(id=peakNames, r_squared_adj=corrsPHY,
+                       effect_size=slopesPHY,pvalue=PvaluesPHY, 
+                       padj = p.adjust(PvaluesPHY))
+phyloRes <- phyloRes[order(phyloRes$padj),]
+phyloRes[1:10,]
+
+write.csv(phyloRes, file="phyloRes.csv")
+```
+
+## Plotting
+
+```{r}
+#t-test results
+ggplot(data = diffResultsSortF, aes(x=pvalue)) +
+    geom_histogram() +
+    labs(x = "Raw P-Value",
+         y = "Frequency",
+         title = "Histogram of t-Test P-Values")
+
+ggplot(data = diffResultsSortF, aes(x=meanDiff)) +
+    geom_histogram() +
+    labs(x = "Difference of Means",
+         y = "Frequency",
+         title = "Histogram of t-Test Mean Differences")
+
+#phyloLM results
+ggplot(data = phyloRes, aes(x=pvalue)) +
+    geom_histogram() +
+    labs(x = "Raw P-Value",
+         y = "Frequency",
+         title = "Histogram of PhyloLM P-Values")
+
+ggplot(data = phyloRes, aes(x=effect_size)) +
+    geom_histogram() +
+    labs(x = "Effect Size",
+         y = "Frequency",
+         title = "Histogram of t-Test Mean Differences")
+```
+
+OLD CODE THAT IS NOW USELESS
+
+```{r} 
+
+# #elaborate stuff to rename rows
+# spec_names_temp <- combined_hyp_peaks$X
+# spec_names <- c()
+# curIndex <- 1
+# chop <- 4
+# for(s in spec_names_temp) {
+#     spec_names <- c(spec_names, substr(s, 1, nchar(s)-chop))
+#     curIndex <- curIndex + 1
+#     if(curIndex > 9) {
+#         chop = 5
+#     }
+#     if(curIndex > 99) {
+#         chop=6
+#     }
+# }
+# length(spec_names)
+# dim(combined_hyp_peaks)
+# #rownames(combined_hyp_peaks) <- spec_names
+# #combined_hyp_peaks[1:5,1:5]
+
+# peakLmFit <- phylolm(as.numeric(combined_hyp_peaks[,1]) ~ hypselodont, data=combined_hyp_peaks, phy=zoonomiaTree, model="BM")
+# peakLmFitSum <- summary(peakLmFit)
+# peakLmFitSum
+# peakLmFit$coefficients
+# peakLmFit$adj.r.squared
+
+```
+
+
